@@ -71,9 +71,11 @@ Parse arguments provided after `/gh-prs`.
 | --dry-run | false | Fetch and display only — no sub-agents |
 | --yes | false | Skip confirmation and auto-process |
 | --cron | false | Cron-safe mode: spawn agents, exit without waiting |
-| --model | _(none)_ | Model for sub-agents (e.g., `glm-5`) |
+| --model | _(none)_ | Default model for all sub-agents (overridden by specific flags below) |
 | --reviewer-agent | coding | Agent ID for code review tasks |
+| --reviewer-model | _(inherits --model)_ | Model for reviewer sub-agent (e.g., `kimi-k2.6`) |
 | --fixer-agent | coding | Agent ID for CI failure fix tasks |
+| --fixer-model | _(inherits --model)_ | Model for fixer sub-agent (e.g., `minimax-2.5`) |
 | --workspace | auto | Workspace directory for git operations. `auto` = `/data/.clawdbot/gh-prs-workspace/{repo-slug}` |
 | --notify-channel | _(none)_ | Channel ID to send summaries to |
 
@@ -83,7 +85,9 @@ Parse arguments provided after `/gh-prs`.
 - `STATE_FILE` = `/data/.clawdbot/gh-prs-state-{REPO_SLUG}.json`
 - `CLAIMS_FILE` = `/data/.clawdbot/gh-prs-claims.json` (shared with gh-issues for cross-skill coordination)
 - `REVIEWER_AGENT` = --reviewer-agent value (default: coding)
+- `REVIEWER_MODEL` = --reviewer-model value, or --model, or none
 - `FIXER_AGENT` = --fixer-agent value (default: coding)
+- `FIXER_MODEL` = --fixer-model value, or --model, or none
 
 ---
 
@@ -431,9 +435,12 @@ constraints:
   - Be constructive and specific in feedback
   - Time limit: 30 minutes
 agentId: {REVIEWER_AGENT}
+model: {REVIEWER_MODEL}
 runTimeoutSeconds: 1800
 cleanup: keep
 ```
+
+**Note on model specification:** Include `model: {REVIEWER_MODEL}` in spawn config only if REVIEWER_MODEL is set (not empty). If empty, omit the model field to use default.
 
 **7.3 — Spawn Failed Checks Sub-agent:**
 
@@ -490,9 +497,12 @@ constraints:
   - Time limit: 60 minutes
   - CAN touch fix/issue-* branches for CI fixes only (not for new features)
 agentId: {FIXER_AGENT}
+model: {FIXER_MODEL}
 runTimeoutSeconds: 3600
 cleanup: keep
 ```
+
+**Note on model specification:** Include `model: {FIXER_MODEL}` in spawn config only if FIXER_MODEL is set. If empty, omit to use default.
 
 **Cron mode behavior:**
 - Spawn all agents without waiting
