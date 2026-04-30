@@ -261,11 +261,48 @@ A PR can be approved when:
 - All gh-prs review comments are resolved (fixed by author)
 - No new critical issues found in re-review
 - CI checks are passing
+- PR is up-to-date with base branch
 
 ```
 OPEN_COMMENTS=$(cat "$STATE_FILE" | jq -r ".pr_comments[\"{pr_number}\"] // [] | map(select(.status == \"open\")) | length")
-if [ "$OPEN_COMMENTS" -eq 0 ] && [ "$CHECKS_PASSING" = "true" ]; then
+if [ "$OPEN_COMMENTS" -eq 0 ] && [ "$CHECKS_PASSING" = "true" ] && [ "$BRANCH_UPTODATE" = "true" ]; then
   CAN_APPROVE=true
+fi
+```
+
+**4.6 — Check if PR is out-of-date with base branch:**
+
+GitHub shows "out-of-date" when the PR's base branch is behind the upstream base branch.
+
+```
+# Fetch PR details including mergeable_state
+PR_DETAILS=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+  "https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}")
+
+MERGEABLE_STATE=$(echo "$PR_DETAILS" | jq -r '.mergeable_state')
+BASE_REF=$(echo "$PR_DETAILS" | jq -r '.base.ref')
+HEAD_SHA=$(echo "$PR_DETAILS" | jq -r '.head.sha')
+
+# Check if behind by comparing commits
+BEHIND_BY=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+  "https://api.github.com/repos/{SOURCE_REPO}/compare/{BASE_REF}...{HEAD_SHA}" | \
+  jq -r '.behind_by // 0')
+
+if [ "$BEHIND_BY" -gt 0 ] && [ "$MERGEABLE_STATE" = "behind" ]; then
+  NEEDS_REBASE=true
+  echo "PR #{pr_number} is $BEHIND_BY commits behind $BASE_REF"
+fi
+```
+
+If `NEEDS_REBASE` is true, add to `REBASE_NEEDED` list for a sub-agent to update the branch.
+
+**4.7 — Check for merge conflicts:**
+
+If `mergeable_state` is `dirty`, the PR has conflicts that need resolution:
+```
+if [ "$MERGEABLE_STATE" = "dirty" ]; then
+  echo "PR #{pr_number} has merge conflicts - notify author"
+  # Add to notification list but don't auto-fix (requires human decision)
 fi
 ```**
 
@@ -616,6 +653,64 @@ cleanup: keep
 ```
 
 **Note on model specification:** Include `model: {FIXER_MODEL}` in spawn config only if FIXER_MODEL is set. If empty, omit to use default.
+
+**7.4 — Spawn Rebase Sub-agent (for out-of-date PRs):**
+
+For each PR that needs to be updated with latest base branch changes:
+
+```yaml
+runtime: subagent
+mode: run
+task: |
+  You are updating a PR branch with the latest changes from the base branch.
+  
+  ## PR Details
+  - PR #{pr_number} in {SOURCE_REPO}
+  - PR branch: {head_ref}
+  - Base branch: {base_ref}
+  - Commits behind: {behind_by}
+  
+  ## Instructions
+  1. CLONE: Set up workspace:
+     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-rebase-{pr_number}
+     cd /tmp/gh-prs-rebase-{pr_number}
+  
+  2. FETCH and CHECKOUT PR branch:
+     git fetch origin pull/{pr_number}/head:{head_ref}
+     git checkout {head_ref}
+  
+  3. FETCH base branch:
+     git fetch origin {base_ref}:{base_ref}
+  
+  4. REBASE or MERGE (prefer rebase for clean history):
+     Option A - Rebase (preferred):
+       git rebase origin/{base_ref}
+       
+     Option B - Merge (if rebase has conflicts):
+       git merge origin/{base_ref} -m "Merge {base_ref} into {head_ref}"
+  
+  5. PUSH: Update the PR branch:
+     git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
+     git push origin HEAD:{head_ref} --force-with-lease
+  
+  6. REPORT: Success/failure and method used (rebase vs merge)
+
+constraints:
+  - Prefer rebase for clean history
+  - If conflicts: abort rebase, use merge instead
+  - Never force push without --force-with-lease
+  - Time limit: 15 minutes
+agentId: {FIXER_AGENT}
+model: {FIXER_MODEL}
+runTimeoutSeconds: 900
+cleanup: keep
+```
+
+**After rebase:** Update state to mark PR as rebased and trigger re-review since new commits were added:
+```bash
+jq --arg pr "{pr_number}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.rebased_prs[$pr] = {"rebased_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+```
 
 **Cron mode behavior:**
 - Spawn all agents without waiting
