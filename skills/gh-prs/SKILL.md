@@ -257,14 +257,12 @@ if [ -f "$PR_CLAIMS_FILE" ]; then
 fi
 ```
 
-**Skip gh-issues managed PRs:**
-Skip any PR where `head.ref` starts with `fix/issue-` — these are managed by gh-issues skill:
-```
-if echo "{head_ref}" | grep -q "^fix/issue-"; then
-  echo "Skipping PR #{pr_number} — branch {head_ref} is managed by gh-issues skill"
-  SKIP_PR=true
-fi
-```
+**Note on gh-issues PRs:**
+PRs with `fix/issue-*` branches are created by gh-issues skill, but gh-issues only **addresses review comments** on them — it does NOT:
+- Review the code (that's our job)
+- Fix CI failures (that's also our job)
+
+So we DO process these PRs for code review and CI fixes. We just don't address comments on them.
 
 ---
 
@@ -332,13 +330,19 @@ fi
 echo $$ > "$LOCK_FILE"
 ```
 
-**6.2 — Skip gh-issues managed PRs (double-check):**
+**6.2 — Skip gh-issues managed PRs ONLY for comment addressing:**
 
-For each PR in action list, verify branch doesn't match gh-issues pattern:
+We already removed comment addressing from this skill. For code review and CI fixes, we process ALL PRs including `fix/issue-*` branches.
+
+The only time we skip `fix/issue-*` PRs is if gh-issues has an ACTIVE claim on that specific PR (meaning it's currently addressing comments). Check claims file:
 ```
-if echo "{head_ref}" | grep -q "^fix/issue-"; then
-  echo "Skipping #{pr_number} — fix/issue-* branch reserved for gh-issues skill"
-  remove_from_action_list $pr_number
+if [ -f "$PR_CLAIMS_FILE" ]; then
+  # Check if gh-issues has a claim on this specific PR
+  ACTIVE_ISSUES_CLAIM=$(cat "/data/.clawdbot/gh-issues-claims.json" 2>/dev/null | jq -r --arg key "{SOURCE_REPO}#{pr_number}" '.[$key] // empty')
+  if [ -n "$ACTIVE_ISSUES_CLAIM" ]; then
+    echo "Skipping #{pr_number} — gh-issues is actively addressing comments on this PR"
+    remove_from_action_list $pr_number
+  fi
 fi
 ```
 
@@ -426,7 +430,6 @@ constraints:
   - Do NOT approve or request changes — just leave comments
   - Be constructive and specific in feedback
   - Time limit: 30 minutes
-  - Do NOT touch branches matching pattern "fix/issue-*" (gh-issues reserved)
 agentId: {REVIEWER_AGENT}
 runTimeoutSeconds: 1800
 cleanup: keep
@@ -485,7 +488,7 @@ constraints:
   - Don't change functionality unless tests require it
   - Keep changes minimal
   - Time limit: 60 minutes
-  - Do NOT touch branches matching "fix/issue-*" (gh-issues reserved)
+  - CAN touch fix/issue-* branches for CI fixes only (not for new features)
 agentId: {FIXER_AGENT}
 runTimeoutSeconds: 3600
 cleanup: keep
