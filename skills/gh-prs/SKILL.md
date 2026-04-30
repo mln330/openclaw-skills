@@ -16,17 +16,17 @@ metadata:
               "kind": "brew",
               "formula": "gh",
               "bins": ["gh"],
-              "label": "Install GitHub CLI (brew)",
+              "label": "Install GitHub CLI (brew)"
             },
             {
               "id": "apt",
               "kind": "apt",
               "package": "gh",
               "bins": ["gh"],
-              "label": "Install GitHub CLI (apt)",
-            },
-          ],
-      },
+              "label": "Install GitHub CLI (apt)"
+            }
+          ]
+      }
   }
 ---
 
@@ -111,7 +111,15 @@ Export for subsequent commands:
 export GH_TOKEN="<token>"
 ```
 
-**2.2 — Workspace Setup:**
+**2.2 — Resolve Current User:**
+
+Resolve the current authenticated user for comparison in Phase 4.2:
+```
+CURRENT_USER=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user | jq -r '.login')
+export CURRENT_USER
+```
+
+**2.3 — Workspace Setup:**
 
 Create workspace directory (for git operations, isolated from gh-issues):
 ```
@@ -122,11 +130,12 @@ Ensure workspace has a clone of the repo (shallow clone if missing):
 ```
 if [ ! -d "{WORKSPACE_DIR}/.git" ]; then
   cd "{WORKSPACE_DIR}"
-  git clone --depth 100 "https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git" .
+  GIT_TERMINAL_PROMPT=0 git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" .
+  git config url."https://github.com/".insteadOf "https://x-access-token:${GH_TOKEN}@github.com/"
 fi
 ```
 
-**2.3 — State File Setup:**
+**2.4 — State File Setup:**
 
 Initialize state tracking file:
 ```
@@ -247,7 +256,8 @@ if [ "$(echo "$EXISTING_COMMENTS" | jq 'length')" -gt 0 ]; then
     LINE_NUM=$(echo "$comment" | jq -r '.line')
     
     # Check if the line was modified in recent commits
-    if ! echo "$CURRENT_DIFF" | grep -A5 -B5 "^@@.*$FILE_PATH" | grep "^+$LINE_NUM," >/dev/null; then
+    # git diff uses space-prefixed context lines; match line number followed by non-digit
+    if ! echo "$CURRENT_DIFF" | grep -A5 -B5 "^@@.*$FILE_PATH" | grep -E "^\+$LINE_NUM[^0-9]" >/dev/null; then
       # Line not in recent diff, likely fixed - mark for resolution
       echo "Comment $COMMENT_ID on $FILE_PATH:$LINE_NUM appears resolved"
     fi
@@ -284,8 +294,9 @@ BASE_REF=$(echo "$PR_DETAILS" | jq -r '.base.ref')
 HEAD_SHA=$(echo "$PR_DETAILS" | jq -r '.head.sha')
 
 # Check if behind by comparing commits
+# behind_by exists when HEAD_SHA is behind BASE_REF, so compare HEAD_SHA...BASE_REF
 BEHIND_BY=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-  "https://api.github.com/repos/{SOURCE_REPO}/compare/{BASE_REF}...{HEAD_SHA}" | \
+  "https://api.github.com/repos/{SOURCE_REPO}/compare/{HEAD_SHA}...{BASE_REF}" | \
   jq -r '.behind_by // 0')
 
 if [ "$BEHIND_BY" -gt 0 ] && [ "$MERGEABLE_STATE" = "behind" ]; then
@@ -304,7 +315,7 @@ if [ "$MERGEABLE_STATE" = "dirty" ]; then
   echo "PR #{pr_number} has merge conflicts - notify author"
   # Add to notification list but don't auto-fix (requires human decision)
 fi
-```**
+```
 
 **Concurrency Check — CRITICAL:**
 
@@ -423,7 +434,10 @@ if [ -f "$PR_CLAIMS_FILE" ]; then
   ACTIVE_ISSUES_CLAIM=$(cat "/data/.clawdbot/gh-issues-claims.json" 2>/dev/null | jq -r --arg key "{SOURCE_REPO}#{pr_number}" '.[$key] // empty')
   if [ -n "$ACTIVE_ISSUES_CLAIM" ]; then
     echo "Skipping #{pr_number} — gh-issues is actively addressing comments on this PR"
-    remove_from_action_list $pr_number
+    # Remove from action lists by unsetting action flags
+    unset NEEDS_REVIEW
+    unset NEEDS_REREVIEW
+    unset NEEDS_FIX
   fi
 fi
 ```
@@ -478,7 +492,9 @@ task: |
   
   ## Instructions
   1. CLONE: If not already cloned, shallow clone the repo to a temp location:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-review-{pr_number}
+     GIT_TERMINAL_PROMPT=0 git clone --depth 100 https://github.com/{SOURCE_REPO}.git /tmp/gh-prs-review-{pr_number}
+     cd /tmp/gh-prs-review-{pr_number}
+     git config url."https://github.com/".insteadOf "https://x-access-token:${GH_TOKEN}@github.com/"
   
   2. FETCH: Get PR details and diff:
      - PR info: curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}
@@ -497,7 +513,7 @@ task: |
        ```
        COMMENT_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
          https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}/comments \
-         -d '{"commit_id":"{head_sha}","path":"file.js","line":42,"body":"comment"}')
+         -d "{\"commit_id\":\"{head_sha}\",\"path\":\"file.js\",\"line\":42,\"body\":\"comment body\"}")
        COMMENT_ID=$(echo "$COMMENT_RESPONSE" | jq -r '.id')
        ```
      - For general PR review:
@@ -607,12 +623,13 @@ task: |
   
   ## Instructions
   1. CLONE: Set up workspace:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-checks-{pr_number}
+     GIT_TERMINAL_PROMPT=0 git clone --depth 100 https://github.com/{SOURCE_REPO}.git /tmp/gh-prs-checks-{pr_number}
      cd /tmp/gh-prs-checks-{pr_number}
+     git config url."https://github.com/".insteadOf "https://x-access-token:${GH_TOKEN}@github.com/"
   
   2. FETCH: Get PR branch and check details:
-     - git fetch origin pull/{pr_number}/head:pr-branch
-     - git checkout pr-branch
+     - git fetch origin pull/{pr_number}/head:{head_ref}
+     - git checkout {head_ref}
      - Get failed checks: curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/{SOURCE_REPO}/commits/{head_sha}/check-runs
      - Get check output/logs if available
   
@@ -635,8 +652,7 @@ task: |
   6. PUSH: Push fixes to PR branch:
      git add .
      git commit -m "ci: fix failing checks - {description}"
-     git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
-     git push origin HEAD:{pr_branch}
+     git push origin HEAD:{head_ref}
   
   7. REPORT: Summary of what was fixed and how
 
@@ -672,8 +688,9 @@ task: |
   
   ## Instructions
   1. CLONE: Set up workspace:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-rebase-{pr_number}
+     GIT_TERMINAL_PROMPT=0 git clone --depth 100 https://github.com/{SOURCE_REPO}.git /tmp/gh-prs-rebase-{pr_number}
      cd /tmp/gh-prs-rebase-{pr_number}
+     git config url."https://github.com/".insteadOf "https://x-access-token:${GH_TOKEN}@github.com/"
   
   2. FETCH and CHECKOUT PR branch:
      git fetch origin pull/{pr_number}/head:{head_ref}
@@ -690,7 +707,6 @@ task: |
        git merge origin/{base_ref} -m "Merge {base_ref} into {head_ref}"
   
   5. PUSH: Update the PR branch:
-     git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
      git push origin HEAD:{head_ref} --force-with-lease
   
   6. REPORT: Success/failure and method used (rebase vs merge)
