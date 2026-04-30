@@ -72,6 +72,9 @@ Parse arguments provided after `/gh-prs`.
 | --yes | false | Skip confirmation and auto-process |
 | --cron | false | Cron-safe mode: spawn agents, exit without waiting |
 | --model | _(none)_ | Model for sub-agents (e.g., `glm-5`) |
+| --reviewer-agent | coding | Agent ID for code review tasks |
+| --responder-agent | coding | Agent ID for comment response tasks |
+| --fixer-agent | coding | Agent ID for CI failure fix tasks |
 | --workspace | auto | Workspace directory for git operations. `auto` = `/data/.clawdbot/gh-prs-workspace/{repo-slug}` |
 | --notify-channel | _(none)_ | Channel ID to send summaries to |
 
@@ -80,6 +83,9 @@ Parse arguments provided after `/gh-prs`.
 - `WORKSPACE_DIR` = --workspace value or auto-generated path
 - `STATE_FILE` = `/data/.clawdbot/gh-prs-state-{REPO_SLUG}.json`
 - `CLAIMS_FILE` = `/data/.clawdbot/gh-prs-claims.json` (shared with gh-issues for cross-skill coordination)
+- `REVIEWER_AGENT` = --reviewer-agent value (default: coding)
+- `RESPONDER_AGENT` = --responder-agent value (default: coding)
+- `FIXER_AGENT` = --fixer-agent value (default: coding)
 
 ---
 
@@ -435,7 +441,7 @@ constraints:
   - Do NOT approve or request changes — just leave comments
   - Be constructive and specific in feedback
   - Time limit: 30 minutes
-agentId: coding
+agentId: {REVIEWER_AGENT}
 runTimeoutSeconds: 1800
 cleanup: keep
 ```
@@ -490,7 +496,7 @@ constraints:
   - If comments conflict, address most recent and note the conflict
   - Time limit: 60 minutes
   - Do NOT touch branches matching pattern "fix/issue-*" (gh-issues reserved)
-agentId: coding
+agentId: {RESPONDER_AGENT}
 runTimeoutSeconds: 3600
 cleanup: keep
 ```
@@ -549,7 +555,7 @@ constraints:
   - Keep changes minimal
   - Time limit: 60 minutes
   - Do NOT touch branches matching "fix/issue-*" (gh-issues reserved)
-agentId: coding
+agentId: {FIXER_AGENT}
 runTimeoutSeconds: 3600
 cleanup: keep
 ```
