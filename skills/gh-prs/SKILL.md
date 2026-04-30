@@ -226,7 +226,48 @@ For each check/run:
 
 Add to `FAILED_CHECKS` list.
 
-**NOTE: Comment addressing is handled by gh-issues skill for its issue-fix PRs. This skill does NOT address review comments — it only reviews code and fixes CI failures.**
+**NOTE:** Comment addressing is handled by gh-issues skill for its issue-fix PRs. This skill does NOT address review comments — it only reviews code and fixes CI failures.
+
+**4.4 — Check existing gh-prs comments for resolution:**
+
+For each PR with previous gh-prs review comments:
+```
+# Get existing review comments from gh-prs
+EXISTING_COMMENTS=$(cat "$STATE_FILE" | jq -r ".pr_comments[\"{pr_number}\"] // []")
+
+if [ "$(echo "$EXISTING_COMMENTS" | jq 'length')" -gt 0 ]; then
+  # Fetch current PR diff to check if commented lines changed
+  CURRENT_DIFF=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+    -H "Accept: application/vnd.github.v3.diff" \
+    "https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}")
+  
+  for comment in $(echo "$EXISTING_COMMENTS" | jq -c '.[]'); do
+    COMMENT_ID=$(echo "$comment" | jq -r '.id')
+    FILE_PATH=$(echo "$comment" | jq -r '.file')
+    LINE_NUM=$(echo "$comment" | jq -r '.line')
+    
+    # Check if the line was modified in recent commits
+    if ! echo "$CURRENT_DIFF" | grep -A5 -B5 "^@@.*$FILE_PATH" | grep "^+$LINE_NUM," >/dev/null; then
+      # Line not in recent diff, likely fixed - mark for resolution
+      echo "Comment $COMMENT_ID on $FILE_PATH:$LINE_NUM appears resolved"
+    fi
+  done
+fi
+```
+
+**4.5 — Determine if approval is warranted:**
+
+A PR can be approved when:
+- All gh-prs review comments are resolved (fixed by author)
+- No new critical issues found in re-review
+- CI checks are passing
+
+```
+OPEN_COMMENTS=$(cat "$STATE_FILE" | jq -r ".pr_comments[\"{pr_number}\"] // [] | map(select(.status == \"open\")) | length")
+if [ "$OPEN_COMMENTS" -eq 0 ] && [ "$CHECKS_PASSING" = "true" ]; then
+  CAN_APPROVE=true
+fi
+```**
 
 **Concurrency Check — CRITICAL:**
 
@@ -388,7 +429,7 @@ jq --arg key "{SOURCE_REPO}#{pr_number}" --argjson val "$CLAIM_DATA" \
   mv "${PR_CLAIMS_FILE}.tmp" "$PR_CLAIMS_FILE"
 ```
 
-**7.2 — Spawn Review Sub-agent:**
+**7.2 — Spawn Review Sub-agent (with comment tracking & approval):**
 
 For each PR needing review:
 
@@ -414,33 +455,105 @@ task: |
      - Look for missing error handling
      - Verify documentation updates if needed
   
-  4. COMMENT: Post review comments using GitHub API:
+  4. COMMENT: Post review comments using GitHub API and capture comment IDs:
      - For inline comments on specific lines:
-       curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
+       ```
+       COMMENT_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
          https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}/comments \
-         -d '{"commit_id":"{head_sha}","path":"file.js","line":42,"body":"comment"}'
+         -d '{"commit_id":"{head_sha}","path":"file.js","line":42,"body":"comment"}')
+       COMMENT_ID=$(echo "$COMMENT_RESPONSE" | jq -r '.id')
+       ```
      - For general PR review:
-       curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
+       ```
+       REVIEW_RESPONSE=$(curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
          https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}/reviews \
-         -d '{"commit_id":"{head_sha}","body":"summary","event":"COMMENT","comments":[...]}'
+         -d '{"commit_id":"{head_sha}","body":"summary","event":"COMMENT","comments":[...]}')
+       REVIEW_ID=$(echo "$REVIEW_RESPONSE" | jq -r '.id')
+       ```
   
-  5. REPORT: Return a summary:
+  5. APPROVAL: If {CAN_APPROVE} is set to true (all previous gh-prs comments resolved, no new critical issues, CI passing):
+     - Submit approval:
+       ```
+       curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
+         https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}/reviews \
+         -d '{"commit_id":"{head_sha}","body":"All review comments addressed. LGTM!","event":"APPROVE"}'
+       ```
+  
+  6. REPORT: Return a summary:
      - Number of issues found by category (critical, warning, suggestion)
      - Files reviewed
      - Lines of code changed
      - Review submitted: yes/no
+     - Approval submitted: yes/no
+     - **JSON comment tracking data** (for new comments created)
 
 constraints:
-  - Do NOT approve or request changes — just leave comments
+  - If CAN_APPROVE: submit approval, else just leave comments
   - Be constructive and specific in feedback
   - Time limit: 30 minutes
+  - MUST return JSON comment tracking data if new comments created
 agentId: {REVIEWER_AGENT}
 model: {REVIEWER_MODEL}
 runTimeoutSeconds: 1800
 cleanup: keep
 ```
 
-**Note on model specification:** Include `model: {REVIEWER_MODEL}` in spawn config only if REVIEWER_MODEL is set (not empty). If empty, omit the model field to use default.
+**7.2.1 — Check for Comment Resolution Before Spawning:**
+
+Before spawning reviewer, check if previous gh-prs comments were addressed:
+```bash
+# Fetch existing gh-prs comments from state
+EXISTING_COMMENTS=$(cat "$STATE_FILE" | jq -r ".pr_comments[\"{pr_number}\"] // []")
+
+if [ "$(echo "$EXISTING_COMMENTS" | jq 'length')" -gt 0 ]; then
+  # Fetch current PR files to compare
+  CURRENT_FILES=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
+    "https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}/files")
+  
+  RESOLVED_COUNT=0
+  for comment in $(echo "$EXISTING_COMMENTS" | jq -c '.[]'); do
+    COMMENT_ID=$(echo "$comment" | jq -r '.id')
+    FILE_PATH=$(echo "$comment" | jq -r '.file')
+    LINE_NUM=$(echo "$comment" | jq -r '.line')
+    
+    # Check if the file/line was modified in recent commits
+    # If patch doesn't include this line anymore, mark as resolved
+    if ! echo "$CURRENT_FILES" | jq -e --arg f "$FILE_PATH" '.[] | select(.filename == $f)' >/dev/null; then
+      # File removed/changed significantly - mark resolved
+      RESOLVED_COUNT=$((RESOLVED_COUNT + 1))
+      # Update state to mark comment resolved
+      jq --arg pr "{pr_number}" --arg cid "$COMMENT_ID" \
+        '.pr_comments[$pr] |= map(if .id == $cid then .status = "resolved" else . end)' \
+        "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+    fi
+  done
+  
+  # Check if all comments resolved
+  OPEN_COMMENTS=$(cat "$STATE_FILE" | jq -r ".pr_comments[\"{pr_number}\"] // [] | map(select(.status == \"open\")) | length")
+  if [ "$OPEN_COMMENTS" -eq 0 ]; then
+    CAN_APPROVE=true
+  fi
+fi
+```
+
+**7.2.2 — Update State with New Comments:**
+
+After reviewer finishes, parse output for comment tracking JSON:
+```bash
+# Parse comment tracking from reviewer output
+NEW_COMMENTS='{pr_number}__comment_json_from_output'
+if [ -n "$NEW_COMMENTS" ] && [ "$NEW_COMMENTS" != "null" ]; then
+  # Add status field to each comment
+  COMMENTS_WITH_STATUS=$(echo "$NEW_COMMENTS" | jq '[.comments[] | . + {"status": "open"}]')
+  jq --arg pr "{pr_number}" --argjson data "$COMMENTS_WITH_STATUS" \
+    '.pr_comments[$pr] = $data' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+fi
+
+# Update processed_prs
+jq --arg pr "{pr_number}" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  '.processed_prs[$pr] = {"status": "reviewed", "last_sha": $sha, "reviewed_at": $time}' \
+  "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+```
 
 **7.3 — Spawn Failed Checks Sub-agent:**
 
