@@ -472,13 +472,38 @@ git checkout -b fix/issue-{number} {BASE_BRANCH}
 - Change only what is necessary to fix the issue
 - Do not add unrelated changes or new dependencies without justification
 
-5. TEST — Discover and run the existing test suite if one exists:
-- Look for package.json scripts, Makefile targets, pytest, cargo test, etc.
-- Run the relevant tests
-- If tests fail after your fix, attempt ONE retry with a corrected approach
-- If tests still fail, report the failure
+5. **VALIDATE — Pre-push verification (CRITICAL):**
+   
+   Before committing, verify your changes won't break CI:
+   
+   **For Bicep files:**
+   ```
+   # Install Bicep CLI if needed
+   curl -Lo /tmp/bicep https://github.com/Azure/bicep/releases/latest/download/bicep-linux-x64
+   chmod +x /tmp/bicep
+   
+   # Validate Bicep syntax
+   /tmp/bicep build main.bicep 2>&1 || echo "BICEP_VALIDATION_FAILED"
+   /tmp/bicep build main.test.bicepparam 2>&1 || echo "BICEP_VALIDATION_FAILED"
+   ```
+   
+   **For GitHub Actions workflows:**
+   ```
+   # Verify action references exist (not just version, the whole action)
+   curl -s -I https://github.com/marketplace/actions/{action-name} | head -1
+   # Or check if the repo has an action.yml in the expected location
+   curl -s https://raw.githubusercontent.com/{owner}/{repo}/refs/tags/{version}/action.yml | head -5
+   ```
+   
+   **For YAML files:**
+   ```
+   # Basic YAML syntax validation
+   python3 -c "import yaml; yaml.safe_load(open('file.yml'))" 2>&1 || echo "YAML_SYNTAX_FAILED"
+   ```
+   
+   If any validation fails, fix the issues BEFORE committing. Do not push broken code.
 
-6. COMMIT — Stage and commit your changes:
+6. **COMMIT — Stage and commit your changes only after validation passes:**
 git add {changed_files}
 git commit -m "fix: {short_description}
 
@@ -834,14 +859,39 @@ git pull {PUSH_REMOTE} {branch_name}
 3. IMPLEMENT — For each comment, make the requested change:
 - Read the file and locate the relevant code
 - Make the change the reviewer requested
+- **CHECK RELATED CODE:** Don't just fix the exact line mentioned — check nearby lines for similar issues
+  - Example: If reviewer says "add working-directory here", also check if OTHER steps need working-directory
+  - Example: If reviewer mentions PATH issue, verify the PATH is persisted correctly across ALL steps
+  - Example: If fixing one property, verify similar properties don't have the same issue
 - If the comment is vague or you disagree, still attempt a reasonable fix but note your concern
 - If the comment asks for something impossible or contradictory, skip it and explain why in your reply
 
-4. TEST — Run existing tests to make sure your changes don't break anything:
-- If tests fail, fix the issue or revert the problematic change
-- Note any test failures in your replies
+4. **VALIDATE — Pre-push verification (CRITICAL):**
+   
+   Before pushing review fixes, verify they work:
+   
+   **For Bicep files:**
+   ```
+   # Validate the fixed Bicep still builds
+   /tmp/bicep build main.bicep 2>&1 || echo "BICEP_VALIDATION_FAILED"
+   ```
+   
+   **For GitHub Actions workflows:**
+   ```
+   # Verify action references are valid
+   curl -s https://raw.githubusercontent.com/{owner}/{repo}/refs/tags/{version}/action.yml | head -5 || echo "ACTION_NOT_FOUND"
+   
+   # Validate YAML syntax
+   python3 -c "import yaml; yaml.safe_load(open('.github/workflows/ci.yml'))" 2>&1 || echo "YAML_SYNTAX_FAILED"
+   ```
+   
+   **For PATH/environment changes:**
+   - Verify that changes persist across steps (e.g., using $GITHUB_PATH instead of export)
+   - Check that ALL steps that need the PATH have access to it, not just the current step
+   
+   If validation fails, fix before committing.
 
-5. COMMIT — Stage and commit all changes in a single commit:
+5. COMMIT — Stage and commit all changes only after validation passes:
 git add {changed_files}
 git commit -m "fix: address review comments on PR #{pr_number}
 
