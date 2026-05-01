@@ -7,26 +7,10 @@ metadata:
     "openclaw":
       {
         "emoji": "🔍",
-        "requires": { "bins": ["curl", "git", "gh"] },
+        "requires": { "bins": ["curl", "git"] },
         "primaryEnv": "GH_TOKEN",
-        "install":
-          [
-            {
-              "id": "brew",
-              "kind": "brew",
-              "formula": "gh",
-              "bins": ["gh"],
-              "label": "Install GitHub CLI (brew)",
-            },
-            {
-              "id": "apt",
-              "kind": "apt",
-              "package": "gh",
-              "bins": ["gh"],
-              "label": "Install GitHub CLI (apt)",
-            },
-          ],
-      },
+        "install": []
+      }
   }
 ---
 
@@ -122,7 +106,8 @@ Ensure workspace has a clone of the repo (shallow clone if missing):
 ```
 if [ ! -d "{WORKSPACE_DIR}/.git" ]; then
   cd "{WORKSPACE_DIR}"
-  git clone --depth 100 "https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git" .
+  git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" .
+  git config url.https://x-access-token:$GH_TOKEN@github.com/.insteadOf https://github.com/
 fi
 ```
 
@@ -151,6 +136,7 @@ fi
 if [ "{author}" = "@me" ]; then
   # Resolve current user first
   ME=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user | jq -r '.login')
+CURRENT_USER=$ME
   QUERY_PARAMS="$QUERY_PARAMS&author=$ME"
 elif [ -n "{author}" ]; then
   QUERY_PARAMS="$QUERY_PARAMS&author={author}"
@@ -247,7 +233,11 @@ if [ "$(echo "$EXISTING_COMMENTS" | jq 'length')" -gt 0 ]; then
     LINE_NUM=$(echo "$comment" | jq -r '.line')
     
     # Check if the line was modified in recent commits
-    if ! echo "$CURRENT_DIFF" | grep -A5 -B5 "^@@.*$FILE_PATH" | grep "^+$LINE_NUM," >/dev/null; then
+    # Diff hunks show added lines with + prefix; check if line_num appears in a hunk for this file
+    if echo "$CURRENT_DIFF" | grep -E "^\+" | grep -F "$LINE_NUM" >/dev/null 2>&1; then
+      # Line still present in diff (was added), not yet fixed
+      :
+    else
       # Line not in recent diff, likely fixed - mark for resolution
       echo "Comment $COMMENT_ID on $FILE_PATH:$LINE_NUM appears resolved"
     fi
@@ -285,7 +275,7 @@ HEAD_SHA=$(echo "$PR_DETAILS" | jq -r '.head.sha')
 
 # Check if behind by comparing commits
 BEHIND_BY=$(curl -s -H "Authorization: Bearer $GH_TOKEN" \
-  "https://api.github.com/repos/{SOURCE_REPO}/compare/{BASE_REF}...{HEAD_SHA}" | \
+  "https://api.github.com/repos/{SOURCE_REPO}/compare/{HEAD_SHA}...{BASE_REF}" | \
   jq -r '.behind_by // 0')
 
 if [ "$BEHIND_BY" -gt 0 ] && [ "$MERGEABLE_STATE" = "behind" ]; then
@@ -423,7 +413,7 @@ if [ -f "$PR_CLAIMS_FILE" ]; then
   ACTIVE_ISSUES_CLAIM=$(cat "/data/.clawdbot/gh-issues-claims.json" 2>/dev/null | jq -r --arg key "{SOURCE_REPO}#{pr_number}" '.[$key] // empty')
   if [ -n "$ACTIVE_ISSUES_CLAIM" ]; then
     echo "Skipping #{pr_number} — gh-issues is actively addressing comments on this PR"
-    remove_from_action_list $pr_number
+    unset NEEDS_REVIEW NEEDS_REREVIEW NEEDS_FIX
   fi
 fi
 ```
@@ -478,7 +468,9 @@ task: |
   
   ## Instructions
   1. CLONE: If not already cloned, shallow clone the repo to a temp location:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-review-{pr_number}
+     git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" /tmp/gh-prs-review-{pr_number}
+     cd /tmp/gh-prs-review-{pr_number}
+     git config url.https://x-access-token:$GH_TOKEN@github.com/.insteadOf https://github.com/
   
   2. FETCH: Get PR details and diff:
      - PR info: curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/{SOURCE_REPO}/pulls/{pr_number}
@@ -607,8 +599,9 @@ task: |
   
   ## Instructions
   1. CLONE: Set up workspace:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-checks-{pr_number}
+     git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" /tmp/gh-prs-checks-{pr_number}
      cd /tmp/gh-prs-checks-{pr_number}
+     git config url.https://x-access-token:$GH_TOKEN@github.com/.insteadOf https://github.com/
   
   2. FETCH: Get PR branch and check details:
      - git fetch origin pull/{pr_number}/head:pr-branch
@@ -636,7 +629,7 @@ task: |
      git add .
      git commit -m "ci: fix failing checks - {description}"
      git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
-     git push origin HEAD:{pr_branch}
+     git push origin HEAD:{head_ref}
   
   7. REPORT: Summary of what was fixed and how
 
@@ -672,8 +665,9 @@ task: |
   
   ## Instructions
   1. CLONE: Set up workspace:
-     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-prs-rebase-{pr_number}
+     git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" /tmp/gh-prs-rebase-{pr_number}
      cd /tmp/gh-prs-rebase-{pr_number}
+     git config url.https://x-access-token:$GH_TOKEN@github.com/.insteadOf https://github.com/
   
   2. FETCH and CHECKOUT PR branch:
      git fetch origin pull/{pr_number}/head:{head_ref}
@@ -728,14 +722,18 @@ STATE_FILE="/data/.clawdbot/gh-prs-state-{REPO_SLUG}.json"
 
 # Update processed PRs
 for pr in $REVIEWED_PRS; do
-  jq --arg pr "$pr" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '.processed_prs[$pr] = {"status": "reviewed", "last_sha": $sha, "reviewed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+  if [ -n "$pr" ]; then
+    jq --arg pr "$pr" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.processed_prs[$pr] = {"status": "reviewed", "last_sha": $sha, "reviewed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+  fi
 done
 
 # Update processed checks
 for check_id in $FIXED_CHECKS; do
-  jq --arg id "$check_id" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '.processed_checks[$id] = {"fixed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+  if [ -n "$check_id" ]; then
+    jq --arg id "$check_id" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '.processed_checks[$id] = {"fixed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+  fi
 done
 
 # Update last poll timestamp
@@ -747,7 +745,9 @@ jq --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_poll = $time' "$STATE_FILE
 ```bash
 PR_CLAIMS_FILE="/data/.clawdbot/gh-prs-claims.json"
 for pr in $PROCESSED_PRS; do
-  jq --arg key "{SOURCE_REPO}#$pr" 'del(.[$key])' "$PR_CLAIMS_FILE" > tmp.json && mv tmp.json "$PR_CLAIMS_FILE"
+  if [ -n "$pr" ]; then
+    jq --arg key "{SOURCE_REPO}#$pr" 'del(.[$key])' "$PR_CLAIMS_FILE" > tmp.json && mv tmp.json "$PR_CLAIMS_FILE"
+  fi
 done
 ```
 
@@ -811,7 +811,7 @@ On stop, present cumulative summary of all activity.
 
 1. **Workspace Separation:** gh-prs uses `/data/.clawdbot/gh-prs-workspace/` while gh-issues uses the main workspace
 2. **Claim Checking:** Before any operation, check `/data/.clawdbot/gh-issues-claims.json` for active claims
-3. **Branch Pattern Exclusion:** **NEVER touch branches matching `fix/issue-*`** — these are reserved for gh-issues skill
+3. **Branch Pattern Exclusion:** **NEVER push to branches matching `fix/issue-*`** for comment addressing — these are reserved for gh-issues skill (code review and CI fixes on these branches ARE allowed)
 4. **File Locking:** Use process-level locks to prevent concurrent git operations
 
 **Claim Expiration:**

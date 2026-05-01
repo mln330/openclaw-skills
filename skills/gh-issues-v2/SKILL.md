@@ -8,8 +8,8 @@ metadata:
       {
         "requires": { "bins": ["curl", "git", "jq"] },
         "primaryEnv": "GH_APP_ID",
-        "install": [],
-      },
+        "install": []
+      }
   }
 ---
 
