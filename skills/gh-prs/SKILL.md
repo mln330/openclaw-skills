@@ -1,6 +1,6 @@
 ---
 name: gh-prs
-description: "Poll GitHub PRs for review requests, new iterations, and failed CI checks. Spawn sub-agents to review code or fix failing CI. Avoids concurrency conflicts with gh-issues skill via workspace isolation."
+description: "Poll GitHub PRs for review requests and new iterations. Spawn sub-agents to review code. Avoids concurrency conflicts with gh-issues skill via workspace isolation."
 user-invocable: true
 metadata:
   {
@@ -14,7 +14,7 @@ metadata:
   }
 ---
 
-# gh-prs — Automated GitHub PR Review & CI Failure Handler
+# gh-prs — Automated GitHub PR Reviewer
 
 You are an orchestrator for PR automation. Follow these phases exactly.
 
@@ -58,8 +58,7 @@ Parse arguments provided after `/gh-prs`.
 | --model | _(none)_ | Default model for all sub-agents (overridden by specific flags below) |
 | --reviewer-agent | coding | Agent ID for code review tasks |
 | --reviewer-model | _(inherits --model)_ | Model for reviewer sub-agent (e.g., `kimi-k2.6`) |
-| --fixer-agent | coding | Agent ID for CI failure fix tasks |
-| --fixer-model | _(inherits --model)_ | Model for fixer sub-agent (e.g., `minimax-2.5`) |
+
 | --workspace | auto | Workspace directory for git operations. `auto` = `/data/.clawdbot/gh-prs-workspace/{repo-slug}` |
 | --notify-channel | _(none)_ | Channel ID to send summaries to |
 
@@ -70,8 +69,6 @@ Parse arguments provided after `/gh-prs`.
 - `CLAIMS_FILE` = `/data/.clawdbot/gh-prs-claims.json` (shared with gh-issues for cross-skill coordination)
 - `REVIEWER_AGENT` = --reviewer-agent value (default: coding)
 - `REVIEWER_MODEL` = --reviewer-model value, or --model, or none
-- `FIXER_AGENT` = --fixer-agent value (default: coding)
-- `FIXER_MODEL` = --fixer-model value, or --model, or none
 
 ---
 
@@ -191,30 +188,7 @@ if [ "$LAST_SHA" ] && [ "{head_sha}" != "$LAST_SHA" ]; then
 fi
 ```
 
-**4.3 — Failed CI checks:**
-
-Fetch check runs for PR's HEAD commit:
-```
-curl -s -H "Authorization: Bearer $GH_TOKEN" \
-  "https://api.github.com/repos/{SOURCE_REPO}/commits/{head_sha}/check-runs"
-```
-
-Also fetch via actions API:
-```
-curl -s -H "Authorization: Bearer $GH_TOKEN" \
-  "https://api.github.com/repos/{SOURCE_REPO}/actions/runs?head_sha={head_sha}"
-```
-
-For each check/run:
-- If `conclusion` is `failure` or `action_required`
-- And check/run ID not in `processed_checks` state
-- And no agent is currently working on this PR
-
-Add to `FAILED_CHECKS` list.
-
-**NOTE:** Comment addressing is handled by gh-issues skill for its issue-fix PRs. This skill does NOT address review comments — it only reviews code and fixes CI failures.
-
-**4.4 — Check existing gh-prs comments for resolution:**
+**4.3 — Check existing gh-prs comments for resolution:**
 
 For each PR with previous gh-prs review comments:
 ```
@@ -245,7 +219,7 @@ if [ "$(echo "$EXISTING_COMMENTS" | jq 'length')" -gt 0 ]; then
 fi
 ```
 
-**4.5 — Determine if approval is warranted:**
+**4.4 — Determine if approval is warranted:**
 
 A PR can be approved when:
 - All gh-prs review comments are resolved (fixed by author)
@@ -260,7 +234,7 @@ if [ "$OPEN_COMMENTS" -eq 0 ] && [ "$CHECKS_PASSING" = "true" ] && [ "$BRANCH_UP
 fi
 ```
 
-**4.6 — Check if PR is out-of-date with base branch:**
+**4.5 — Check if PR is out-of-date with base branch:**
 
 GitHub shows "out-of-date" when the PR's base branch is behind the upstream base branch.
 
@@ -286,7 +260,7 @@ fi
 
 If `NEEDS_REBASE` is true, add to `REBASE_NEEDED` list for a sub-agent to update the branch.
 
-**4.7 — Check for merge conflicts:**
+**4.6 — Check for merge conflicts:**
 
 If `mergeable_state` is `dirty`, the PR has conflicts that need resolution:
 ```
@@ -330,11 +304,9 @@ fi
 ```
 
 **Note on gh-issues PRs:**
-PRs with `fix/issue-*` branches are created by gh-issues skill, but gh-issues only **addresses review comments** on them — it does NOT:
-- Review the code (that's our job)
-- Fix CI failures (that's also our job)
+PRs with `fix/issue-*` branches are created by gh-issues skill, but gh-issues only **addresses review comments** on them — it does NOT review the code (that's our job).
 
-So we DO process these PRs for code review and CI fixes. We just don't address comments on them.
+So we DO process these PRs for code review. We just don't address comments on them.
 
 ---
 
@@ -375,7 +347,6 @@ If `--yes`: Auto-process all.
 Otherwise, ask user:
 - "all" — process everything
 - "review-only" — only review new/updated PRs
-- "checks-only" — only fix failed checks
 - Comma-separated PR numbers — process only those
 - "cancel" — abort
 
@@ -404,7 +375,7 @@ echo $$ > "$LOCK_FILE"
 
 **6.2 — Skip gh-issues managed PRs ONLY for comment addressing:**
 
-We already removed comment addressing from this skill. For code review and CI fixes, we process ALL PRs including `fix/issue-*` branches.
+We already removed comment addressing from this skill. For code review, we process ALL PRs including `fix/issue-*` branches.
 
 The only time we skip `fix/issue-*` PRs is if gh-issues has an ACTIVE claim on that specific PR (meaning it's currently addressing comments). Check claims file:
 ```
@@ -437,7 +408,7 @@ CLAIM_DATA=$(cat <<EOF
 {
   "repo": "{SOURCE_REPO}",
   "pr_number": {pr_number},
-  "action": "{review|fix-checks}",
+  "action": "{review}",
   "claimed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "expires": "$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+2H +%Y-%m-%dT%H:%M:%SZ)"
 }
@@ -584,70 +555,7 @@ jq --arg pr "{pr_number}" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%d
   "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
 ```
 
-**7.3 — Spawn Failed Checks Sub-agent:**
-
-For each PR with failed checks:
-
-```yaml
-runtime: subagent
-mode: run
-task: |
-  You are fixing failed CI checks on PR #{pr_number} in {SOURCE_REPO}.
-  
-  ## Context
-  This PR has failing checks. Your job is to diagnose and fix them.
-  
-  ## Instructions
-  1. CLONE: Set up workspace:
-     git clone --depth 100 "https://github.com/{SOURCE_REPO}.git" /tmp/gh-prs-checks-{pr_number}
-     cd /tmp/gh-prs-checks-{pr_number}
-     git config url.https://x-access-token:$GH_TOKEN@github.com/.insteadOf https://github.com/
-  
-  2. FETCH: Get PR branch and check details:
-     - git fetch origin pull/{pr_number}/head:pr-branch
-     - git checkout pr-branch
-     - Get failed checks: curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/{SOURCE_REPO}/commits/{head_sha}/check-runs
-     - Get check output/logs if available
-  
-  3. DIAGNOSE: Identify root causes:
-     - Read failing test output
-     - Check for lint errors
-     - Look for build failures
-     - Check for dependency issues
-  
-  4. FIX: Make necessary changes:
-     - Fix code causing test failures
-     - Fix lint/formatting issues
-     - Update dependencies if needed
-     - Add missing files
-  
-  5. VERIFY: Run checks locally if possible:
-     - npm test, pytest, etc.
-     - eslint, prettier, etc.
-  
-  6. PUSH: Push fixes to PR branch:
-     git add .
-     git commit -m "ci: fix failing checks - {description}"
-     git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
-     git push origin HEAD:{head_ref}
-  
-  7. REPORT: Summary of what was fixed and how
-
-constraints:
-  - Only fix what's needed for checks to pass
-  - Don't change functionality unless tests require it
-  - Keep changes minimal
-  - Time limit: 60 minutes
-  - CAN touch fix/issue-* branches for CI fixes only (not for new features)
-agentId: {FIXER_AGENT}
-model: {FIXER_MODEL}
-runTimeoutSeconds: 3600
-cleanup: keep
-```
-
-**Note on model specification:** Include `model: {FIXER_MODEL}` in spawn config only if FIXER_MODEL is set. If empty, omit to use default.
-
-**7.4 — Spawn Rebase Sub-agent (for out-of-date PRs):**
+**7.3 — Spawn Rebase Sub-agent (for out-of-date PRs):**
 
 For each PR that needs to be updated with latest base branch changes:
 
@@ -694,8 +602,8 @@ constraints:
   - If conflicts: abort rebase, use merge instead
   - Never force push without --force-with-lease
   - Time limit: 15 minutes
-agentId: {FIXER_AGENT}
-model: {FIXER_MODEL}
+agentId: {REVIEWER_AGENT}
+model: {REVIEWER_MODEL}
 runTimeoutSeconds: 900
 cleanup: keep
 ```
@@ -725,14 +633,6 @@ for pr in $REVIEWED_PRS; do
   if [ -n "$pr" ]; then
     jq --arg pr "$pr" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       '.processed_prs[$pr] = {"status": "reviewed", "last_sha": $sha, "reviewed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
-  fi
-done
-
-# Update processed checks
-for check_id in $FIXED_CHECKS; do
-  if [ -n "$check_id" ]; then
-    jq --arg id "$check_id" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '.processed_checks[$id] = {"fixed_at": $time}' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
   fi
 done
 
@@ -811,7 +711,7 @@ On stop, present cumulative summary of all activity.
 
 1. **Workspace Separation:** gh-prs uses `/data/.clawdbot/gh-prs-workspace/` while gh-issues uses the main workspace
 2. **Claim Checking:** Before any operation, check `/data/.clawdbot/gh-issues-claims.json` for active claims
-3. **Branch Pattern Exclusion:** **NEVER push to branches matching `fix/issue-*`** for comment addressing — these are reserved for gh-issues skill (code review and CI fixes on these branches ARE allowed)
+3. **Branch Pattern Exclusion:** **NEVER push to branches matching `fix/issue-*`** for comment addressing — these are reserved for gh-issues skill (code review on these branches IS allowed)
 4. **File Locking:** Use process-level locks to prevent concurrent git operations
 
 **Claim Expiration:**
@@ -877,7 +777,7 @@ curl -X POST -H "Authorization: Bearer $GH_TOKEN" \
 ## Notes
 
 - **Comment addressing is intentionally excluded** — gh-issues skill handles review comments on its `fix/issue-*` PRs
-- gh-prs only reviews code and fixes CI failures
+- gh-prs only reviews code
 - Always specify `--repo owner/repo` when not in a git directory
 - GH_TOKEN must have `repo` and `pull_requests:write` scope for reviews
 - Rate limits: 5000 requests/hour for authenticated users

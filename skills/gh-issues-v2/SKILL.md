@@ -1,6 +1,6 @@
 ---
 name: gh-issues-v2
-description: "Fetch GitHub issues, spawn sub-agents to implement fixes and open PRs, then monitor and address PR review comments. Uses GitHub Apps for auth. Usage: /gh-issues-v2 [owner/repo] [--label bug] [--limit 5] [--milestone v1.0] [--assignee @me] [--fork user/repo] [--watch] [--interval 5] [--reviews-only] [--cron] [--dry-run] [--fixer-agent coding] [--fixer-model ollama/minimax-m2.7:cloud] [--notify-channel -1002381931352]"
+description: "Fetch GitHub issues, spawn sub-agents to implement fixes and open PRs, then monitor and address PR review comments, and fix failed CI checks. Uses GitHub Apps for auth. Usage: /gh-issues-v2 [owner/repo] [--label bug] [--limit 5] [--milestone v1.0] [--assignee @me] [--fork user/repo] [--watch] [--interval 5] [--reviews-only] [--fix-checks] [--cron] [--dry-run] [--model glm-5] [--comment-model ollama/kimi-k2.6:cloud] [--fixer-agent coding] [--fixer-model ollama/minimax-m2.7:cloud] [--notify-channel -1002381931352]"
 user-invocable: true
 metadata:
   {
@@ -13,7 +13,7 @@ metadata:
   }
 ---
 
-# gh-issues-v2 — Auto-fix GitHub Issues with GitHub Apps Auth
+# gh-issues-v2 — Auto-fix GitHub Issues, Review Comments, and CI Failures
 
 You are an orchestrator. Follow these 6 phases exactly. Do not skip phases.
 
@@ -52,8 +52,10 @@ Flags (all optional):
 | --dry-run | false | Fetch and display only — no sub-agents |
 | --yes | false | Skip confirmation and auto-process all filtered issues |
 | --reviews-only | false | Skip issue processing (Phases 2-5). Only run Phase 6 — check open PRs for review comments and address them. |
+| --fix-checks | false | Skip issue processing (Phases 2-5). Only run Phase 7 — check open PRs for failing CI checks and fix them. |
 | --cron | false | Cron-safe mode: fetch issues and spawn sub-agents, exit without waiting for results. |
-| --model | _(none)_ | Model to use for sub-agents (e.g. `glm-5`, `zai/glm-5`). If not specified, uses the agent's default model. |
+| --model | _(none)_ | Model to use for issue-fixing sub-agents (Phases 3-5). If not specified, uses the agent's default model. |
+| --comment-model | _(inherits --model)_ | Model for review comment addressing sub-agents (Phase 6). Falls back to --model if not set. |
 | --fixer-agent | coding | Agent ID for spawned fix sub-agents |
 | --fixer-model | _(none)_ | Model for spawned fix sub-agents (e.g., `ollama/minimax-m2.7:cloud`) |
 | --notify-channel | _(none)_ | Telegram channel ID to send final PR summary to (e.g. -1002381931352). Only the final result with PR links is sent, not status updates. |
@@ -65,15 +67,21 @@ Derived values:
 - SOURCE_REPO = the positional owner/repo (where issues live)
 - PUSH_REPO = --fork value if provided, otherwise same as SOURCE_REPO
 - FORK_MODE = true if --fork was provided, false otherwise
+- COMMENT_MODEL = --comment-model value, or --model, or none
 - FIXER_AGENT = --fixer-agent value (default: coding)
 - FIXER_MODEL = --fixer-model value (or none)
 
 **If `--reviews-only` is set:** Skip directly to Phase 6. Run token resolution (from Phase 2) first, then jump to Phase 6.
 
+**If `--fix-checks` is set:** Skip directly to Phase 7. Run token resolution (from Phase 2) first, then jump to Phase 7.
+
+**If both `--reviews-only` and `--fix-checks` are set:** Run Phases 6 and 7 sequentially (Phase 6 first, then Phase 7).
+
 **If `--cron` is set:**
 
 - Force `--yes` (skip confirmation)
 - If `--reviews-only` is also set, run token resolution then jump to Phase 6 (cron review mode)
+- If `--fix-checks` is also set, run token resolution then jump to Phase 7 (cron CI-fix mode)
 - Otherwise, proceed normally through Phases 2-5 with cron-mode behavior active
 
 ---
@@ -591,7 +599,7 @@ runtime: subagent
 mode: run
 task: [task from above]
 agentId: {FIXER_AGENT}
-model: {FIXER_MODEL}  # only if FIXER_MODEL is set
+model: {COMMENT_MODEL}  # only if COMMENT_MODEL is set, else omit
 runTimeoutSeconds: 3600
 cleanup: keep
 ```
@@ -671,7 +679,8 @@ When both `--cron` and `--reviews-only` are set:
 4. **Analyze comment content for actionability** (Step 6.3)
 5. If actionable comments are found, spawn ONE review-fix sub-agent for the first PR with unaddressed comments — fire-and-forget (do NOT await result)
    - Use `cleanup: "keep"` and `runTimeoutSeconds: 3600`
-   - If `--model` was provided, include `model: "{MODEL}"` in the spawn config
+   - If COMMENT_MODEL is set, include `model: "{COMMENT_MODEL}"` in the spawn config
+   - If `--model` was provided (legacy fallback), include `model: "{MODEL}"`
 6. Report: "Spawned review handler for PR #{N} — will push fixes when complete"
 7. Exit the skill immediately. Do not proceed to Step 6.5 (Review Results).
 
@@ -945,8 +954,8 @@ For comments you could NOT address, reply explaining why:
 - runTimeoutSeconds: 3600 (60 minutes)
 - cleanup: "keep" (preserve transcripts for review)
 - agentId: {FIXER_AGENT} (from --fixer-agent flag, default: coding)
-- If FIXER_MODEL is set, include `model: "{FIXER_MODEL}"` in the spawn config
-- If `--model` was provided (legacy), use as fallback
+- If COMMENT_MODEL is set, include `model: "{COMMENT_MODEL}"` in the spawn config
+- If `--model` was provided (legacy fallback), use that
 
 **Example:**
 ```yaml
@@ -954,7 +963,7 @@ runtime: subagent
 mode: run
 task: [review fix task]
 agentId: {FIXER_AGENT}
-model: {FIXER_MODEL}  # only if set
+model: {COMMENT_MODEL}  # only if COMMENT_MODEL is set, else omit
 runTimeoutSeconds: 3600
 cleanup: keep
 ```
@@ -974,6 +983,228 @@ Add comment IDs from this batch to `ADDRESSED_COMMENTS` set to prevent re-proces
 
 ---
 
+## Phase 7 — CI Failure Fixer
+
+This phase monitors open PRs for failing CI checks and spawns fixer sub-agents to diagnose and resolve them.
+
+**When this phase runs:**
+
+- Always after Phase 6 (PR Review Handler) if `--fix-checks` is NOT set
+- Immediately if invoked with `--fix-checks`
+- On each watch poll after Phase 6 completes (or is skipped)
+
+### Step 7.1 — Fetch Open PRs
+
+Get all open PRs in {SOURCE_REPO}:
+```
+curl -s -H "Authorization: Bearer $GH_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/{SOURCE_REPO}/pulls?state=open&per_page=100"
+```
+
+For each open PR, fetch check runs:
+```
+head_sha=$(echo "$pr" | jq -r '.head.sha')
+curl -s -H "Authorization: Bearer $GH_TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/{SOURCE_REPO}/commits/$head_sha/check-runs"
+```
+
+### Step 7.2 — Identify PRs with Failed Checks
+
+For each PR, check if any check runs have failed:
+- Filter out checks from `dependabot[bot]`
+- A check is "failed" if `status == "completed"` AND `conclusion NOT IN ("success", "neutral", "skipped")`
+- Track `failed_check_names` as array of failed check names
+- Track `failed_check_count` as the number of unique failed checks
+
+Build `FAILED_PR_CHECKS` list of PRs where:
+- `failed_check_count > 0`
+- PR is not currently being processed (check state file for status `"fixing"`)
+- PR has no active claims in claims file
+
+### Step 7.3 — Cross-Skill Claims Coordination
+
+Read the shared claims file to avoid conflicts with gh-prs skill:
+```
+DATA_DIR="$HOME/.openclaw/workspace/.gh-issues-data"
+PR_CLAIMS_FILE="$DATA_DIR/gh-prs-claims.json"
+```
+
+For each PR in `FAILED_PR_CHECKS`:
+- Check if `gh-prs-claims.json` has an active claim for `{SOURCE_REPO}#{pr_number}`
+- If claimed by gh-prs and not expired → skip (gh-prs is handling this PR)
+- If claim is expired or missing → proceed
+
+Write our own claim for each PR we're going to fix:
+```
+CLAIM_DATA=$(cat <<EOF
+{
+  "repo": "{SOURCE_REPO}",
+  "pr_number": {pr_number},
+  "action": "fix-checks",
+  "claimed_by": "gh-issues-v2",
+  "claimed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "expires": "$(date -u -d '+2 hours' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+2H +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+)
+
+jq --arg key "{SOURCE_REPO}#{pr_number}" --argjson val "$CLAIM_DATA" \
+  '.[$key] = $val' "$PR_CLAIMS_FILE" > "${PR_CLAIMS_FILE}.tmp" && \
+  mv "${PR_CLAIMS_FILE}.tmp" "$PR_CLAIMS_FILE"
+```
+
+### Step 7.4 — Determine Fixer Strategy
+
+For each PR, determine the appropriate strategy before spawning fixers:
+
+1. **Fetch latest check run details:**
+   ```
+   curl -s -H "Authorization: Bearer $GH_TOKEN" \
+     -H "Accept: application/vnd.github+json" \
+     "https://api.github.com/repos/{SOURCE_REPO}/commits/$head_sha/check-runs" | \
+     jq '.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped") | {name, conclusion, html_url, details_url, output: {title, summary, text}}'
+   ```
+
+2. **Determine strategy based on check names:**
+   ```
+   if echo "$failed_check_names" | grep -qi "test"; then
+     STRATEGY="test_failure"
+   elif echo "$failed_check_names" | grep -qi "lint\|format\|style\|prettier\|eslint\|black\|flake\|mypy"; then
+     STRATEGY="code_style"
+   elif echo "$failed_check_names" | grep -qi "build\|compile\|typecheck\|typescript"; then
+     STRATEGY="compilation"
+   elif echo "$failed_check_names" | grep -qi "security\|scan\|vuln\|dependabot"; then
+     STRATEGY="security"  # skip, don't fix security failures
+   else
+     STRATEGY="general"
+   fi
+   ```
+
+3. **Skip security-related failures:**
+   ```
+   if [ "$STRATEGY" = "security" ]; then
+     echo "Skipping security failure for PR #$pr_number — requires manual review"
+     continue
+   fi
+   ```
+
+### Step 7.5 — Present & Confirm
+
+Display table of PRs with failed checks:
+```
+| PR | Title | Failed Checks | Strategy | Branch |
+|----|-------|---------------|----------|--------|
+| #42 | Fix memory leak | test-unit, lint | test_failure, code_style | fix/issue-42 |
+```
+
+If `--yes` or `--dry-run`: stop after display.
+
+Otherwise, ask user which PRs to fix: "all", comma-separated PR numbers, or "skip".
+
+### Step 7.6 — Spawn Fixer Sub-Agents
+
+For each confirmed PR, spawn a fixer sub-agent:
+
+```yaml
+runtime: subagent
+mode: run
+task: |
+  You are fixing failed CI checks on PR #{pr_number} in {SOURCE_REPO}.
+
+  ## Context
+  This PR has failing checks. Your job is to diagnose and fix them.
+
+  ## Instructions
+  1. SETUP: Get token and clone:
+     ```
+     export GH_TOKEN=$(node "$HOME/.openclaw/workspace/scripts/get-gh-app-token.js" tars-coder)
+     git clone --depth 100 https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git /tmp/gh-issues-checks-{pr_number}
+     cd /tmp/gh-issues-checks-{pr_number}
+     git config --global user.name "TARSCoder"
+     git config --global user.email "3558889+tars-coder@users.noreply.github.com"
+     git config --global --add safe.directory /tmp/gh-issues-checks-{pr_number}
+     ```
+
+  2. FETCH: Get PR branch and check details:
+     - git fetch origin pull/{pr_number}/head:pr-branch
+     - git checkout pr-branch
+     - Get failed checks: curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/{SOURCE_REPO}/commits/{head_sha}/check-runs
+     - Get check output/logs if available
+
+  3. DIAGNOSE: Identify root causes:
+     - Read failing test output
+     - Check for lint errors
+     - Look for build failures
+     - Check for dependency issues
+
+  4. FIX: Make necessary changes:
+     - Fix code causing test failures
+     - Fix lint/formatting issues
+     - Update dependencies if needed
+     - Add missing files
+
+  5. VERIFY: Run checks locally if possible:
+     - npm test, pytest, etc.
+     - eslint, prettier, etc.
+
+  6. PUSH: Push fixes to PR branch:
+     git add .
+     git commit -m "ci: fix failing checks - {description}"
+     git remote set-url origin https://x-access-token:$GH_TOKEN@github.com/{SOURCE_REPO}.git
+     git push origin HEAD:{pr_branch}
+
+  7. REPORT: Summary of what was fixed and how
+
+  ## Rules
+  - Only fix what's needed for checks to pass
+  - Don't change functionality unless tests require it
+  - Keep changes minimal
+  - Time limit: 60 minutes
+
+agentId: {FIXER_AGENT}
+model: {FIXER_MODEL}  # only if FIXER_MODEL is set, else omit
+runTimeoutSeconds: 3600
+cleanup: keep
+```
+
+**Note on model specification:** Include `model: {FIXER_MODEL}` in spawn config only if FIXER_MODEL is set. If empty, omit to use default.
+
+### Step 7.7 — Post-Fix Verification
+
+After a fixer completes:
+1. Wait 60 seconds for new check runs to start
+2. Poll check runs for 5 minutes (30-second intervals)
+3. If checks still fail after fix → log failure, do NOT retry (avoid loops)
+4. If checks pass → update state file:
+   ```
+   jq --arg pr "{pr_number}" --arg sha "{head_sha}" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '.processed_prs[$pr] = {"status": "fixed", "last_sha": $sha, "fixed_at": $time}' \
+     "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+   ```
+
+### Step 7.8 — State File Management
+
+Use a state file for CI failure tracking:
+```
+DATA_DIR="$HOME/.openclaw/workspace/.gh-issues-data"
+mkdir -p "$DATA_DIR"
+STATE_FILE="$DATA_DIR/gh-issues-state-{REPO_SLUG}.json"
+
+if [ ! -f "$STATE_FILE" ]; then
+  echo '{"processed_prs":{},"processed_checks":[]}' > "$STATE_FILE"
+fi
+```
+
+Track processed check run IDs to avoid re-processing the same failures:
+```
+jq --argjson ids '["check-run-id-1", "check-run-id-2"]' \
+  '.processed_checks += $ids' "$STATE_FILE" > tmp.json && mv tmp.json "$STATE_FILE"
+```
+
+---
+
 ## Watch Mode (if --watch is active)
 
 After presenting results from the current batch:
@@ -987,7 +1218,8 @@ After presenting results from the current batch:
    - Issues already in PROCESSED_ISSUES
    - Issues that have existing fix/issue-{N} PRs (caught in Phase 4 pre-flight)
 6. After Phases 2-5 (or if no new issues), run **Phase 6** to check for new review comments on ALL tracked PRs (both newly created and previously opened).
-7. If no new issues AND no new actionable review comments → report "No new activity. Polling again in {interval} minutes..." and loop back to step 4.
+7. After Phase 6 completes, run **Phase 7** to check for and fix failing CI checks on open PRs.
+8. If no new issues AND no new actionable review comments AND no CI failures to fix → report "No new activity. Polling again in {interval} minutes..." and loop back to step 4.
 8. The user can say "stop" at any time to exit watch mode. When stopping, present a final cumulative summary of ALL batches — issues processed AND review comments addressed.
 
 **Context hygiene between polls — IMPORTANT:**
@@ -995,8 +1227,9 @@ Only retain between poll cycles:
 
 - PROCESSED_ISSUES (set of issue numbers)
 - ADDRESSED_COMMENTS (set of comment IDs)
+- PROCESSED_CHECKS (set of check run IDs)
 - OPEN_PRS (list of tracked PRs: number, branch, URL)
-- Cumulative results (one line per issue + one line per review batch)
+- Cumulative results (one line per issue + one line per review batch + one line per CI fix batch)
 - Parsed arguments from Phase 1
 - BASE_BRANCH, SOURCE_REPO, PUSH_REPO, FORK_MODE, BOT_USERNAME
   Do NOT retain issue bodies, comment bodies, sub-agent transcripts, or codebase analysis between polls.
