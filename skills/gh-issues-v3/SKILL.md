@@ -85,6 +85,13 @@ dependencies:
   8: [3, 4]      # Issue 8 depends on issues 3 AND 4
 ```
 
+## Group Dependencies
+```yaml
+group_dependencies:
+  frontend_core: [pr:26]   # Group "frontend_core" blocked until PR #26 merges
+  backend_core: [issue:24, issue:30]  # Group blocked until issues #24, #30 merged
+```
+
 ## Parallel Groups
 ```yaml
 groups:
@@ -96,7 +103,7 @@ groups:
 ## External PRs
 ```yaml
 external_prs:
-  26: "feat/app-shell-dashboard"  # PR #26 blocks group "frontend_core"
+  26: "feat/app-shell-dashboard"  # PR #26 is a pre-existing PR
 ```
 
 ## Constraints
@@ -122,12 +129,12 @@ auto_merge: false
 3. **Batch refresh statuses** → Use GraphQL to check all issue/PR statuses in one query (see Batch Status Check below)
 4. **Update state** → Merge new statuses into state file
 5. **Determine eligible issues** → Issues with ALL dependencies satisfied (status = `merged`)
-6. **Apply group constraints** → Only start issues in earliest incomplete group
+6. **Apply group constraints** → Only start issues in earliest incomplete group, respecting group_dependencies
 7. **Apply max_parallel** → Limit concurrent sub-agents
 
 ### Batch Status Check (Performance Critical)
 
-Instead of N sequential API calls, use a single GraphQL query:
+Instead of N sequential API calls, use a single GraphQL query. All fields must be nested under `repository(owner, name)`.
 
 ```bash
 # Build GraphQL query for all tracked issues + external PRs
@@ -144,8 +151,8 @@ build_status_query() {
   local ext_prs
   ext_prs=$(jq -r '.external_prs | keys[]' "$EXECUTION_STATE_FILE" 2>/dev/null | sort -u | tr '\n' ' ')
   
-  # Build query fragments
-  local query="{"
+  # Build query fragments inside repository
+  local query="{ repository(owner: \"$owner\", name: \"$name\") {"
   
   # Add issue fragments
   for num in $issue_nums; do
@@ -154,15 +161,15 @@ build_status_query() {
   
   # Add PR fragments for fix/issue-{N} branches
   for num in $issue_nums; do
-    query="${query} pr${num}: pullRequests(headRefName: \"fix/issue-${num}\", states: [OPEN, MERGED], first: 1) { nodes { number state merged mergeable } }"
+    query="${query} pr${num}: pullRequests(headRefName: \"fix/issue-${num}\", states: [OPEN, MERGED], first: 1) { nodes { number state merged mergedAt } }"
   done
   
   # Add external PR fragments
   for pr in $ext_prs; do
-    query="${query} extpr${pr}: pullRequest(number: ${pr}) { number state merged mergeable headRefName }"
+    query="${query} extpr${pr}: pullRequest(number: ${pr}) { number state merged mergedAt headRefName }"
   done
   
-  query="${query} }"
+  query="${query} } }"
   
   echo "$query"
 }
@@ -182,29 +189,66 @@ run_batch_status_check() {
     "https://api.github.com/graphql" \
     -d "$json_query" 2>/dev/null)
   
+  # Check for GraphQL errors
+  local gql_errors=$(echo "$result" | jq '.errors // empty' 2>/dev/null)
+  if [ -n "$gql_errors" ] && [ "$gql_errors" != "null" ]; then
+    log "GraphQL errors: $gql_errors"
+    # Fall back to sequential checks
+    return 1
+  fi
+  
+  # Parse from .data.repository
   echo "$result" | jq -r '
+    .data.repository as $repo |
+    
     def issue_status($num):
-      .data["issue\($num)"] as $i |
-      if $i.state == "CLOSED" then "merged"
-      elif $i.closedAt != null then "merged"
+      $repo["issue\($num)"] as $i |
+      if $i == null then "unknown"
+      elif $i.state == "CLOSED" then "closed"
       else "open" end;
     
     def pr_status($num):
-      .data["pr\($num)"].nodes[0] as $p |
+      $repo["pr\($num)"].nodes[0] as $p |
       if $p == null then "no_pr"
-      elif $p.merged then "merged:\($p.number)"
+      elif $p.mergedAt != null then "merged:\($p.number)"
       elif $p.state == "OPEN" then "open:\($p.number)"
       else "closed" end;
     
-    # Output: issue_number status pr_status
-    to_entries[] | select(.key | startswith("issue")) |
-    (.key | ltrimstr("issue")) as $num |
-    "\($num) \(issue_status($num)) \(pr_status($num))"
+    def extpr_status($pr):
+      $repo["extpr\($pr)"] as $p |
+      if $p == null then "unknown"
+      elif $p.mergedAt != null then "merged"
+      elif $p.state == "OPEN" then "open"
+      else "closed" end;
+    
+    # Output statuses
+    ($repo | keys | map(select(startswith("issue"))) | .[] | ltrimstr("issue")) as $num |
+    "issue \($num) \(issue_status($num)) \(pr_status($num))",
+    
+    ($repo | keys | map(select(startswith("extpr"))) | .[] | ltrimstr("extpr")) as $pr |
+    "extpr \($pr) \(extpr_status($pr))"
   ' 2>/dev/null || echo ""
 }
 ```
 
 This reduces 25+ API calls to **1 GraphQL query** (~1-2 seconds total).
+
+### Issue Status vs PR Status
+
+**Important:** Issue "closed" does NOT mean dependency is satisfied. Dependencies are satisfied when:
+- A PR for the issue is **merged** (`mergedAt != null`)
+- Or the issue is explicitly marked `status: "skipped"` in state
+
+Issue states:
+- `open` — issue is open, no PR merged yet
+- `closed` — issue closed (may be without PR, or PR not merged)
+- `merged` — PR for this issue was merged (dependency satisfied)
+
+PR states:
+- `no_pr` — no PR found for this issue
+- `open:N` — PR #N is open
+- `merged:N` — PR #N was merged
+- `closed` — PR was closed without merging
 
 ### External PR Support
 
@@ -213,6 +257,9 @@ Some projects have pre-existing PRs that block issues but are NOT generated by t
 ```yaml
 external_prs:
   26: "feat/app-shell-dashboard"
+
+group_dependencies:
+  frontend_core: [pr:26]   # Group blocked until PR #26 merges
 ```
 
 The skill will:
@@ -229,7 +276,7 @@ After each run, update the execution state:
 {
   "issues": {
     "1": { "status": "merged", "pr": 99, "completed_at": "2026-05-09T21:00:00Z", "last_checked_ms": 1746825600000 },
-    "2": { "status": "in_progress", "pr": 101, "started_at": "2026-05-09T21:30:00Z", "last_checked_ms": 1746825600000 },
+    "2": { "status": "in_progress", "pr": 101, "started_at": "2026-05-09T21:30:00Z", "session_id": "abc-123", "last_checked_ms": 1746825600000 },
     "3": { "status": "pending", "blocked_by": [1] },
     "5": { "status": "blocked", "blocked_by": [1, 2] }
   },
@@ -245,10 +292,10 @@ After each run, update the execution state:
 **Status values:**
 - `pending` — not started, waiting for dependencies
 - `ready` — dependencies satisfied, ready to process
-- `in_progress` — sub-agent spawned
+- `in_progress` — sub-agent spawned (session_id stored)
 - `pr_opened` — PR created, waiting for review/merge
 - `merged` — PR merged, issue complete
-- `failed` — sub-agent failed, will retry on next run
+- `failed` — sub-agent spawn failed, will retry on next run
 - `skipped` — skipped (duplicate, existing PR, etc.)
 
 **Smart caching:** Only re-check issues whose status changed or whose `last_checked_ms` is older than 1 hour. This avoids redundant API calls on every cron run.
@@ -271,8 +318,8 @@ After fetching issues, **filter by execution plan** (if present):
 2. **Smart update:** Only update status if changed or stale (>1 hour since last check)
 3. **Determine eligible issues:**
    - Issue has no dependencies defined → eligible
-   - Issue has dependencies → ALL must be `merged` status
-   - Issue is in a group → previous groups must have all issues `merged`
+   - Issue has dependencies → ALL must have `merged` PRs
+   - Issue is in a group → check group_dependencies satisfied, previous groups complete
 4. **Sort eligible issues:**
    - First: issues in earliest incomplete group
    - Within group: by issue number (ascending)
@@ -287,6 +334,7 @@ If `--dry-run` is active:
   Issue #4 (foundation) [READY] ⏳
   Issue #3 (core) [BLOCKED] — waiting for: #1
   Issue #5 (core) [BLOCKED] — waiting for: #1, #2
+  PR #26 (external) [OPEN] — blocks: frontend_core
   ```
 
 ---
@@ -314,8 +362,8 @@ Same as gh-issues Phase 4, PLUS:
 
 **Additional check: Verify dependency prerequisites are met**
 
-Before processing an issue, re-verify all its dependencies are `merged`. If any dependency is not merged:
-- Skip the issue: "Skipping #{N} — dependency #{dep} not yet complete"
+Before processing an issue, re-verify all its dependencies have `merged` PRs. If any dependency is not merged:
+- Skip the issue: "Skipping #{N} — dependency #{dep} PR not yet merged"
 - Update its status to `blocked` in execution state
 - If all remaining issues are blocked, report: "All issues blocked by dependencies. Waiting for PRs to be merged."
 - If in watch mode, schedule next check for when dependencies might complete
@@ -324,7 +372,7 @@ Before processing an issue, re-verify all its dependencies are `merged`. If any 
 
 ## Phase 5 — Spawn Sub-agents (Dependency-Aware, Fire-and-Forget)
 
-**CRITICAL:** This phase must complete within 60-90 seconds to avoid cron timeout. Use **fire-and-forget** subagent spawning — don't wait for results.
+**CRITICAL:** This phase must complete within 60-90 seconds to avoid cron timeout. Use **fire-and-forget** subagent spawning with acknowledgement.
 
 ### Cron Mode (`--cron` active):
 
@@ -332,10 +380,11 @@ Before processing an issue, re-verify all its dependencies are `merged`. If any 
 2. **Identify ready issues** — dependencies satisfied, not in progress
 3. **Apply group constraints** — only process issues in active (earliest incomplete) group
 4. **Select next issue** — lowest-numbered ready issue in active group
-5. **Spawn sub-agent** via gateway API (async, non-blocking)
-   - Use `sessions_spawn` with `runTimeoutSeconds: 3600` and `mode: "run"`
-   - Immediately update state: `status: "in_progress"`
-   - **DO NOT WAIT** for sub-agent to complete
+5. **Spawn sub-agent** via gateway API — **synchronous acknowledgement, then background execution**
+   - Call `sessions_spawn` with `runTimeoutSeconds: 3600`
+   - **Wait up to 15 seconds** for acknowledgement (session ID in response)
+   - Store session ID in state
+   - **DO NOT WAIT** for sub-agent to complete work
 6. **Exit** (fire and forget)
 
 If `--watch` is active and no ready issues:
@@ -368,7 +417,7 @@ Rules:
 - Run tests before pushing
 - Ensure CI passes"
 
-  # Spawn via gateway API (async)
+  # Build JSON payload
   local json_payload
   json_payload=$(jq -n \
     --arg task "$task" \
@@ -383,27 +432,46 @@ Rules:
       lightContext: true
     }')
   
-  # Fire and forget
-  curl -s -X POST \
+  # Synchronous spawn with acknowledgement (15s timeout)
+  local resp
+  resp=$(curl -s --max-time 15 -X POST \
     -H "Content-Type: application/json" \
     -H "X-Gateway-Token: $GATEWAY_TOKEN" \
     "$GATEWAY_URL/api/v1/sessions/spawn" \
-    -d "$json_payload" > /dev/null 2>&1 &
+    -d "$json_payload" 2>/dev/null)
   
-  # Store PID for tracking
-  local spawn_pid=$!
+  # Extract session ID from response
+  local session_id
+  session_id=$(echo "$resp" | jq -r '.sessionId // .id // empty' 2>/dev/null)
   
-  # Update state immediately
+  if [ -z "$session_id" ]; then
+    log "ERROR: Failed to spawn fixer for issue #$issue_num"
+    log "Response: $resp"
+    # Update state to failed
+    jq --arg num "$issue_num" \
+       --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+       '.issues[$num].status = "failed" |
+        .issues[$num].failed_at = $now |
+        .issues[$num].error = "spawn_failed"' \
+       "$EXECUTION_STATE_FILE" > "$EXECUTION_STATE_FILE.tmp" && \
+       mv "$EXECUTION_STATE_FILE.tmp" "$EXECUTION_STATE_FILE"
+    return 1
+  fi
+  
+  # Update state with session ID
+  local now
+  now=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   jq --arg num "$issue_num" \
-     --arg now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-     --arg pid "$spawn_pid" \
+     --arg now "$now" \
+     --arg sid "$session_id" \
      '.issues[$num].status = "in_progress" |
       .issues[$num].started_at = $now |
-      .issues[$num].spawn_pid = $pid' \
+      .issues[$num].session_id = $sid' \
      "$EXECUTION_STATE_FILE" > "$EXECUTION_STATE_FILE.tmp" && \
      mv "$EXECUTION_STATE_FILE.tmp" "$EXECUTION_STATE_FILE"
   
-  log "Spawned fixer for issue #$issue_num (PID: $spawn_pid)"
+  log "Spawned fixer for issue #$issue_num (session: $session_id)"
+  return 0
 }
 ```
 
@@ -411,7 +479,13 @@ Rules:
 - The orchestrator's job is to **decide what to do**, not **do it**
 - Sub-agents run for 30-60 minutes — cron timeout is 2-5 minutes
 - The sub-agent updates GitHub directly (creates PR, pushes commits)
-- Next cron run will see the new PR and update state accordingly
+- Next cron run will see the new PR via batch status check and update state accordingly
+- Session ID is stored for later status polling if needed
+
+**Spawn failure handling:**
+- If `curl` times out or returns no session ID → mark issue as `failed`
+- Next cron run will retry (up to max retry limit)
+- Log the spawn failure for debugging
 
 ---
 
@@ -473,6 +547,14 @@ external_prs:
   26: "feat/app-shell-dashboard"   # PR #26 blocks group "frontend_core"
 ```
 
+## Group Dependencies
+
+```yaml
+group_dependencies:
+  frontend_core: [pr:26]              # Group blocked until PR #26 merges
+  backend_core: [issue:24, issue:30]  # Group blocked until issues merged
+```
+
 ## Parallel Groups
 
 ```yaml
@@ -514,6 +596,12 @@ dependencies:
 ```yaml
 external_prs:
   26: "feat/app-shell-dashboard"
+```
+
+## Group Dependencies
+```yaml
+group_dependencies:
+  frontend_core: [pr:26]
 ```
 
 ## Groups
@@ -561,7 +649,9 @@ Detected during plan parsing. Report:
 ### Missing Dependencies
 
 If a dependency references an issue not in the fetched list:
-> "Warning: Issue #5 depends on #99, which was not found. Treating #99 as already complete."
+> "Warning: Issue #5 depends on #99, which was not found in fetched issues. Fetching #99 directly..."
+
+The skill will attempt to fetch the missing issue by number before deciding. Only if the issue is confirmed not to exist will it be treated as complete.
 
 ### Invalid Plan Format
 
@@ -577,8 +667,9 @@ If the plan file cannot be parsed:
 The skill is designed to complete Phase 0-5 within 90 seconds:
 - Batch GraphQL queries (1 call vs N calls)
 - Smart caching (skip re-checking unchanged issues)
-- Fire-and-forget subagent spawning (no waiting)
+- Fire-and-forget subagent spawning with 15s acknowledgement timeout
 - Parallel status checks for external PRs
+- `--max-time 15` on all curl calls
 
 If a run exceeds 90 seconds, the orchestrator logs a warning and exits cleanly, leaving state intact for the next run.
 
@@ -591,6 +682,7 @@ If a run exceeds 90 seconds, the orchestrator logs a warning and exits cleanly, 
 | Execution plan | ❌ No | ✅ Yes (ISSUES_EXECUTION_PLAN.md) |
 | Dependency tracking | ❌ No | ✅ Yes (per-issue prerequisites) |
 | External PR support | ❌ No | ✅ Yes (pre-existing PRs as blockers) |
+| Group dependencies | ❌ No | ✅ Yes (groups blocked by external PRs) |
 | Parallel groups | ❌ No | ✅ Yes (phased execution) |
 | Completion detection | ❌ No | ✅ Yes (checks PR merge status) |
 | Group-based processing | ❌ No | ✅ Yes (waits for group before next) |
@@ -598,6 +690,7 @@ If a run exceeds 90 seconds, the orchestrator logs a warning and exits cleanly, 
 | Batch API queries | ❌ No | ✅ Yes (GraphQL) |
 | Smart caching | ❌ No | ✅ Yes (skip stale re-checks) |
 | Fire-and-forget | ❌ No | ✅ Yes (avoids cron timeout) |
+| Spawn acknowledgement | ❌ No | ✅ Yes (session ID tracking) |
 | Timeout prevention | ❌ No | ✅ Yes (90-second target) |
 
 ## Usage Examples
