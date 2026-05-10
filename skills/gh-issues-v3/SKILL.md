@@ -118,7 +118,6 @@ auto_merge: false
 - Dependencies within a group are still respected
 - Issues not in any group run in the "default" group (first)
 - max_parallel defaults to 8 (subagents.maxConcurrent)
-```
 ~~~
 
 ### Dependency Resolution
@@ -577,7 +576,6 @@ auto_merge: false            # Auto-merge PRs when checks pass
 - Dependencies within a group are still respected
 - Issues not in any group run in the "default" group (first)
 - max_parallel defaults to 8 (subagents.maxConcurrent)
-```
 ~~~
 
 **Minimal example:**
