@@ -73,7 +73,7 @@ fi
 
 The execution plan is a YAML-like block inside a markdown file:
 
-```markdown
+~~~markdown
 # Issue Execution Plan
 
 ## Dependencies
@@ -119,8 +119,7 @@ auto_merge: false
 - Issues not in any group run in the "default" group (first)
 - max_parallel defaults to 8 (subagents.maxConcurrent)
 ```
-
-**Full reference:** See `references/EXECUTION_PLAN.md`
+~~~
 
 ### Dependency Resolution
 
@@ -183,7 +182,7 @@ run_batch_status_check() {
   local json_query=$(echo "$query" | jq -Rs '{query: .}')
   
   local result
-  result=$(curl -s -X POST \
+  result=$(curl -s --max-time 15 -X POST \
     -H "Authorization: Bearer $CODER_TOKEN" \
     -H "Content-Type: application/json" \
     "https://api.github.com/graphql" \
@@ -380,8 +379,8 @@ Before processing an issue, re-verify all its dependencies have `merged` PRs. If
 2. **Identify ready issues** — dependencies satisfied, not in progress
 3. **Apply group constraints** — only process issues in active (earliest incomplete) group
 4. **Select next issue** — lowest-numbered ready issue in active group
-5. **Spawn sub-agent** via gateway API — **synchronous acknowledgement, then background execution**
-   - Call `sessions_spawn` with `runTimeoutSeconds: 3600`
+5. **Spawn sub-agent** via gateway spawn API — **synchronous acknowledgement, then background execution**
+   - Use gateway spawn API with `runTimeoutSeconds: 3600`
    - **Wait up to 15 seconds** for acknowledgement (session ID in response)
    - Store session ID in state
    - **DO NOT WAIT** for sub-agent to complete work
@@ -526,7 +525,7 @@ After presenting results:
 
 **Structure:**
 
-```markdown
+~~~markdown
 # Issue Execution Plan
 
 ## Dependencies
@@ -579,10 +578,11 @@ auto_merge: false            # Auto-merge PRs when checks pass
 - Issues not in any group run in the "default" group (first)
 - max_parallel defaults to 8 (subagents.maxConcurrent)
 ```
+~~~
 
 **Minimal example:**
 
-```markdown
+~~~markdown
 # Issue Execution Plan
 
 ## Dependencies
@@ -616,7 +616,7 @@ groups:
 ```yaml
 max_parallel: 3
 ```
-```
+~~~
 
 ---
 
